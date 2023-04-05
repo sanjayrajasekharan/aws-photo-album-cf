@@ -1,3 +1,6 @@
+Parameters:
+  BucketName:
+    Type: String
 Resources:
   FrontendS3Bucket:
     Type: AWS::S3::Bucket
@@ -26,7 +29,7 @@ Resources:
           - Action:
               - s3:GetObject
             Effect: Allow
-            Resource: !Join ['', ['arn:aws:s3:::', !Ref FrontendS3Bucket, '/*']]
+            Resource: !Sub 'arn:aws:s3:::${FrontendS3Bucket}/*'
             Principal: '*'
 
   PhotoS3Bucket:
@@ -34,6 +37,78 @@ Resources:
     Properties:
       BucketName: b2-image-store-cf
       AccessControl: Private
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt LambdaOne.Arn
+
+  # Custom resource to create the Lambda permission
+  CustomResourceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CustomResourceExecutionRole.Arn
+      Runtime: nodejs14.x
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const response = require('cfn-response');
+          exports.handler = (event, context) => {
+            const lambda = new AWS.Lambda();
+            if (event.RequestType === 'Create' || event.RequestType === 'Update') {
+              const params = {
+                Action: 'lambda:InvokeFunction',
+                FunctionName: event.ResourceProperties.FunctionName,
+                Principal: 's3.amazonaws.com',
+                SourceArn: event.ResourceProperties.SourceArn,
+                SourceAccount: event.ResourceProperties.SourceAccount
+              };
+              lambda.addPermission(params, (err, data) => {
+                if (err) response.send(event, context, response.FAILED);
+                else response.send(event, context, response.SUCCESS);
+              });
+            } else {
+              response.send(event, context, response.SUCCESS);
+            }
+          };
+
+  CustomResourceExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CustomResourceExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:AddPermission
+                Resource: !GetAtt LambdaOne.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  LambdaOneS3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaOne
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${PhotoS3Bucket}'
+      SourceAccount: !Ref AWS::AccountId
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -49,6 +124,61 @@ Resources:
               - sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonLexFullAccess
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess
+        - arn:aws:iam::aws:policy/AmazonRekognitionFullAccess
+
+  S3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${PhotoS3Bucket}/*'
+
+  LambdaExecutionRoleTwo:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonLexFullAccess
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess
+      Policies:
+          - PolicyName: LambdaApiGatewayInvokePolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'lambda:InvokeFunction'
+                  Resource: "*"
 
   LambdaOne:
     Type: AWS::Lambda::Function
@@ -70,7 +200,7 @@ Resources:
       FunctionName: search-photos-cf
       Handler: lambda_function.lambda_handler
       Runtime: python3.9
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !GetAtt LambdaExecutionRoleTwo.Arn
       Code:
         ZipFile: |
           const AWS = require('aws-sdk');
@@ -78,3 +208,250 @@ Resources:
               // Your Lambda function code for the second function
           };
 
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: photos-cf
+      EngineVersion: OpenSearch_2.5 #OpenSearch_2.5
+      ClusterConfig:
+        InstanceType: t3.small.search
+        InstanceCount: 1
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+        VolumeType: gp3
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - "es:*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/photos-cf/*"
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: false
+        MasterUserOptions:
+          MasterUserARN: !GetAtt LambdaExecutionRole.Arn
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+
+
+  # API Gateway
+  MyApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: AI-Photo-Search-API-CF
+      Body:
+        swagger: "2.0"
+        info:
+          description: "AI Photo Search application, built during the Cloud and Big Data course\
+            \ at Columbia University."
+          version: "1.0.0"
+          title: "AI Photo Search CF"
+        schemes:
+        - "https"
+        paths:
+          /search:
+            get:
+              operationId: "searchPhotos"
+              produces:
+              - "application/json"
+              parameters:
+              - name: "q"
+                in: "query"
+                required: false
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/SearchResponse"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "500":
+                  description: "500 response"
+                  schema:
+                    $ref: "#/definitions/Error"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                "403":
+                  description: "403 response"
+                  schema:
+                    $ref: "#/definitions/Error"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:605849201636:function:search-photos-cf/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+          /upload/{filename}:
+            put:
+              parameters:
+              - name: "filename"
+                in: "path"
+                required: true
+                type: "string"
+              - name: "Content-Type"
+                in: "header"
+                required: false
+                type: "string"
+              - name: "x-amz-meta-customLabels"
+                in: "header"
+                required: false
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              security:
+              - api_key: []
+              x-amazon-apigateway-integration:
+                credentials: "arn:aws:iam::605849201636:role/APIGatewayS3FullAccessRole"
+                httpMethod: "PUT"
+                uri: "arn:aws:apigateway:us-east-1:s3:path/b2-image-store-cf/{filename}"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestParameters:
+                  integration.request.path.filename: "method.request.path.filename"
+                  integration.request.header.x-amz-meta-customLabels: "method.request.header.x-amz-meta-customLabels"
+                  integration.request.header.Content-Type: "method.request.header.Content-Type"
+                passthroughBehavior: "when_no_templates"
+                contentHandling: "CONVERT_TO_BINARY"
+                type: "aws"
+            options:
+              consumes:
+              - "application/json"
+              parameters:
+              - name: "x-amz-meta-customLabels"
+                in: "header"
+                required: false
+                type: "string"
+              - name: "filename"
+                in: "path"
+                required: true
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,PUT'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,x-amz-meta-customlabels'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+        securityDefinitions:
+          api_key:
+            type: "apiKey"
+            name: "x-api-key"
+            in: "header"
+        definitions:
+          Error:
+            type: "object"
+            properties:
+              code:
+                type: "integer"
+                format: "int32"
+              message:
+                type: "string"
+          Photo:
+            type: "object"
+            properties:
+              url:
+                type: "string"
+              labels:
+                type: "array"
+                items:
+                  type: "string"
+          SearchResponse:
+            type: "object"
+            properties:
+              results:
+                type: "array"
+                items:
+                  $ref: "#/definitions/Photo"
+        x-amazon-apigateway-binary-media-types:
+        - "image/jpeg"
+        - "image/jpg"
+        - "image/png"
+        - "text/base64"
+
+
+  # API Gateway Deployment
+  MyApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      StageName: Stage2
+
+  # Lambda Permission to allow API Gateway to invoke Lambda function
+  LambdaTwoApiGatewayInvokePermissionCF:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaTwo
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyApiGateway}/*/GET/search
+
+Outputs:
+  ApiGatewayUrl:
+    Description: "API Gateway URL"
+    Value: !Sub "https://${MyApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Stage2"
